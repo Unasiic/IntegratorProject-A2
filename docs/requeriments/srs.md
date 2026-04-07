@@ -60,3 +60,76 @@
 **Descrição:** O cliente HTTP do ESP32 **NÃO DEVE** aguardar mais de 5000 milissegundos (5 segundos) pela resposta da API REST. Caso o limite seja atingido, a requisição deve ser abortada (Timeout) para evitar o travamento do loop principal de controle da horta.
 **Categoria:** Performance / Confiabilidade
 **Critério de Aceitação:** Simulando um atraso de 6 segundos na resposta do servidor (via Mock na API), o ESP32 deve encerrar a conexão exatos 5 segundos após o envio do POST, registrando falha, mas continuando a leitura dos sensores sem travar.
+
+## 3. Especificação Comportamental (Casos de Uso)
+
+Abaixo estão descritos os fluxos comportamentais do sistema, mapeando o caminho feliz e, prioritariamente, os mecanismos de recuperação e sobrevivência a falhas físicas, elétricas e de rede.
+
+### UC-01: Coleta e Transmissão em Dois Estágios (Rádio NRF24L01 + Wi-Fi)
+*ID:* UC-01  
+*Ator Principal:* Nó de Campo (Microcontrolador local + NRF24L01) e Nó Base (ESP32 + Wi-Fi)  
+*Pré-condições:* Nó de campo alimentado pelas baterias 18650; Sensores (HM-390, DHT22 e LDR) conectados; Módulos NRF24L01 pareados; ESP32 base conectado à internet.
+
+*Fluxo Principal:*
+1. O Nó de Campo desperta e realiza a leitura dos sensores (HM-390 para umidade do solo, DHT22 para ar, LDR para luz).
+2. O Nó de Campo verifica o nível de tensão da bateria local (via divisor de tensão).
+3. O Nó de Campo empacota os dados e transmite via rádio (NRF24L01) para o Nó Base.
+4. O Nó Base (ESP32) recebe o pacote via rádio e formata um JSON.
+5. O Nó Base conecta à API REST via Wi-Fi e envia o HTTP POST.
+6. O Backend valida e armazena os dados, retornando 201 Created.
+7. O Nó de Campo entra em Deep Sleep para poupar a bateria.
+
+*Fluxos Alternativos:*
+* *A1 (Falha de Wi-Fi no Nó Base):* No passo 5, se o ESP32 Base estiver sem Wi-Fi, ele responde ao Nó de Campo via rádio com um sinal de "Recebido, mas Offline". O Nó Base guarda a leitura em sua memória flash local para envio posterior, e o Nó de Campo volta a dormir normalmente.
+
+*Fluxos de Exceção (Robustez):*
+* *E1 (Interferência de Rádio/Perda de Pacote):* No passo 3, se o Nó de Campo enviar os dados e não receber o Acknowledge (ACK) do NRF24L01 base em 200ms, ele tenta retransmitir até 3 vezes. Se falhar, ele salva o dado localmente e dorme, evitando drenar a bateria tentando achar sinal.
+* *E2 (Leitura Corrompida dos Sensores):* No passo 1, se o DHT22 retornar NaN ou o LDR der leitura fora do range resistivo (0 a 1MOhms indicando cabo rompido), o Nó de Campo envia o pacote com a flag "status": "erro_sensor", alertando o Dashboard sobre a necessidade de manutenção física.
+
+*Pós-condições:* Dados armazenados no banco OU alerta de falha de comunicação/hardware registrado.
+
+---
+
+### UC-02: Irrigação Automática e Proteção de Tensão (MT3608)
+*ID:* UC-02  
+*Ator Principal:* Nó de Campo (Controle Local)  
+*Pré-condições:* Bateria 18650 com carga suficiente; Módulo MT3608 operante; Limite crítico de umidade (ex: < 40%) atingido no sensor HM-390.
+
+*Fluxo Principal:*
+1. O Nó de Campo identifica, via sensor HM-390, que o solo está seco.
+2. O Nó de Campo afere a tensão da bateria e confirma que é suficiente (> 3.5V).
+3. O Nó de Campo aciona o pino digital conectado ao módulo relé de 5V.
+4. O módulo MT3608 eleva a tensão para 5V, atracando o relé e ligando a mini bomba d'água.
+5. A bomba opera por 30 segundos preenchendo a mangueira de silicone.
+6. O Nó de Campo desliga o relé e envia um pacote via NRF24L01 informando "Irrigação Concluída".
+
+*Fluxos Alternativos:*
+* *A1 (Bateria Baixa / Dia Nublado):* No passo 2, se a tensão da bateria estiver abaixo de 3.5V (o painel solar não carregou via TP4056 por falta de sol), o Nó de Campo aborta o acionamento da bomba para evitar o desligamento abrupto do microcontrolador (brownout) e envia um log de "Bateria Baixa - Irrigação Adiada".
+
+*Fluxos de Exceção (Robustez):*
+* *E1 (Falha no Boost MT3608):* No passo 4, se o MT3608 falhar em entregar os 5V, o relé não irá atracar. O microcontrolador registrará a ação de irrigação (após 30s), mas o sensor HM-390 não mostrará aumento de umidade nas leituras seguintes. Se após 2 ciclos de irrigação a umidade não subir, o sistema acusa "Falha Hidráulica/Elétrica" e entra em modo de segurança.
+* *E2 (Timeout Físico da Bomba):* Se o microcontrolador travar durante o passo 5, um Watchdog Timer de hardware reseta a placa após 60 segundos, desarmando automaticamente os pinos do relé para não esgotar a água do reservatório ou queimar a bomba.
+
+*Pós-condições:* Solo irrigado com segurança elétrica garantida OU irrigação abortada para proteção da bateria.
+
+---
+
+### UC-03: Comando Remoto do Dashboard com Latência de Rede
+*ID:* UC-03  
+*Ator Principal:* Usuário e Infraestrutura de Rede  
+*Pré-condições:* Usuário logado na plataforma; Relé da bomba operante.
+
+*Fluxo Principal:*
+1. O usuário visualiza o painel e clica em "Irrigar Canteiro 1" no Dashboard.
+2. O Backend registra o comando e aguarda o próximo check-in do ESP32 Base.
+3. O ESP32 Base faz a requisição Wi-Fi GET, recebe o comando e repassa via rádio (NRF24L01) para o Nó de Campo.
+4. O Nó de Campo aciona o relé da bomba via módulo MT3608.
+5. O Nó de Campo confirma a execução via rádio para o Nó Base.
+6. O Nó Base atualiza a API com o status "Concluído".
+7. O Dashboard atualiza a tela do usuário.
+
+*Fluxos de Exceção (Robustez):*
+* *E1 (Nó de Campo em Deep Sleep):* No passo 3, como o Nó de Campo alimentado por bateria passa a maior parte do tempo dormindo, o ESP32 Base enfileira o comando. O Dashboard exibe ao usuário: "Comando agendado. A irrigação iniciará no próximo despertar do sensor."
+* *E2 (Perda de Comunicação com o Campo):* Se o ESP32 Base possuir o comando, mas o Nó de Campo não responder via rádio após 3 tentativas de despertar, o ESP32 Base devolve erro 503 Service Unavailable - Rádio Offline para a API, e o Dashboard alerta o usuário sobre possível falha física (bateria esgotada ou conduíte rompido).
+
+*Pós-condições:* Comando executado em campo e estado sincronizado na nuvem, respeitando os ciclos de energia e limitações de hardware.
