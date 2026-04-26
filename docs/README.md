@@ -1,6 +1,6 @@
 # Sistema de Monitoramento de Horta Comunitária Inteligente
 
-**Equipe:** Cleive dos Santos Costa - RA: 207900, Lucas Freitas Dias Gonaçalves - RA: 211230
+**Equipe:** Cleive dos Santos Costa - RA: 207900, Lucas Freitas Dias Gonaçalve - RA: 211230, Luís Otávio - RA 194952 e Rafael Mendes - 216729
 **Disciplina:** Projeto Integrador (5º Período - Engenharia de Computação / UNASP-EC)
 
 ## Escopo do Projeto
